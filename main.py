@@ -6,7 +6,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import re
 
-app = FastAPI(title="Resilient Social Media Fact-Checker")
+app = FastAPI(title="Context-Aware Fact Checker")
 
 app.add_middleware(
     CORSMiddleware,
@@ -18,86 +18,78 @@ app.add_middleware(
 class TextPayload(BaseModel):
     text: str
 
-def clean_social_query(text: str, aggressive: bool = False) -> str:
+def extract_the_gist(text: str) -> str:
     """
-    Advanced text processing to remove conversational social media fluff.
+    Intelligently isolates the core factual claim by scoring information density,
+    ignoring social media fluff and preserving the semantic 'gist'.
     """
-    # Universal conversational phrases often found on LinkedIn/Twitter
-    fluff_patterns = [
-        r"super excited to announce", r"thrilled to share", r"proud to share",
-        r"honored to be", r"after months of hard work", r"delighted to",
-        r"i am glad to", r"excited to", r"finally deployed", r"pleased to announce"
-    ]
-    
-    query = text.lower()
-    for pattern in fluff_patterns:
-        query = re.sub(pattern, "", query)
+    # 1. Strip conversational narrative framing
+    fluff_phrases = ["super excited to", "thrilled to share", "proud to announce", "i believe that", "glad to announce", "after months of work"]
+    clean_text = text.lower()
+    for fluff in fluff_phrases:
+        clean_text = clean_text.replace(fluff, "")
         
-    words = re.findall(r'\b\w+(?:%\+)?\b', query)
+    # 2. Break paragraph into individual ideas (sentences)
+    sentences = re.split(r'[.!?\n]+', text)
+    best_sentence = ""
+    highest_score = -1
     
-    stopwords = {
-        "the", "is", "in", "and", "to", "a", "of", "it", "that", "this", "on", "for", 
-        "with", "as", "are", "was", "were", "our", "my", "i", "we", "you", "your", 
-        "about", "finally", "just", "very", "so", "actually", "from", "by", "an"
-    }
-    
-    filtered_words = [w for w in words if w not in stopwords]
-    
-    # Aggressive Mode: Keep only numbers, metrics, percentages, and long industry terms
-    if aggressive:
-        filtered_words = [
-            w for w in filtered_words 
-            if any(char.isdigit() for char in w) or len(w) > 5 or w.endswith('%')
-        ]
+    # 3. Score each sentence for Factual Density
+    for sentence in sentences:
+        if len(sentence.split()) < 3:
+            continue
+            
+        score = 0
+        # Massive boost if the sentence contains numbers, percentages, or money (Hard Facts)
+        if re.search(r'\d+', sentence):
+            score += 15
+        # Boost for capitalized words (Proper Nouns, Institutions, Locations)
+        proper_nouns = len(re.findall(r'\b[A-Z][a-z]+\b', sentence))
+        score += (proper_nouns * 3)
         
-    return " ".join(filtered_words[:8])
-
-def execute_safe_search(query_string: str):
-    """
-    Executes search extraction wrapper safely with error handling
-    """
-    try:
-        with DDGS() as ddgs:
-            return list(ddgs.text(query_string, max_results=3))
-    except Exception:
-        return []
+        if score > highest_score:
+            highest_score = score
+            best_sentence = sentence.strip()
+            
+    if not best_sentence:
+        best_sentence = text 
+        
+    # 4. Clean the winning 'Gist' sentence for the search engine
+    query = re.sub(r'[^\w\s]', '', best_sentence)
+    stopwords = {"the", "a", "an", "is", "are", "was", "were", "i", "my", "we", "our"}
+    words = [w for w in query.split() if w.lower() not in stopwords]
+    
+    # Return a coherent, continuous phrase (max 10 words for search API limits)
+    return " ".join(words[:10])
 
 @app.post("/factcheck")
 def fact_check(payload: TextPayload):
     raw_text = payload.text
     if len(raw_text.split()) < 4:
-         return {"error": "Text segment too brief for meaningful cross-referencing."}
+         return {"error": "Text too short. Please highlight a complete sentence."}
 
-    # STAGE 1: Standard Search
-    search_query = clean_social_query(raw_text, aggressive=False)
-    results = execute_safe_search(search_query)
-    
-    # STAGE 2: If Stage 1 fails, trigger Aggressive Query Relaxation
-    if not results:
-        search_query = clean_social_query(raw_text, aggressive=True)
-        results = execute_safe_search(search_query)
+    # Extract the true context
+    search_query = extract_the_gist(raw_text)
 
-    # Convert results safely into standard format
-    web_results = []
-    if results:
-        for r in results:
-            web_results.append({
-                "title": r.get('title', ''), 
-                "body": r.get('body', ''), 
-                "href": r.get('href', '')
-            })
+    try:
+        web_results = []
+        with DDGS() as ddgs:
+            results = list(ddgs.text(search_query, max_results=3))
+            for r in results:
+                web_results.append({"title": r.get('title', ''), "body": r.get('body', ''), "href": r.get('href', '')})
+    except Exception as e:
+        return {"error": "Live web search was temporarily blocked. Try again in a moment."}
 
-    # If completely empty after fallbacks
     if not web_results:
          return {
-             "verdict": "🚨 Unsubstantiated Narrative", 
+             "verdict": "🚨 Unsubstantiated", 
              "confidence_score": "0%", 
-             "best_source_title": "No Public Verification Document Found", 
+             "best_source_title": "No Public Verification Found", 
              "best_source_url": "N/A", 
-             "best_source_snippet": "This claim likely represents private company performance, localized anecdotes, or unindexed claims that are absent from formal public documentation."
+             "best_source_snippet": f"Could not find web evidence for the core claim: '{search_query}'"
          }
 
-    # MATHEMATICAL VECTOR MATCHING
+    # Semantic comparison between the original text and the web articles
     corpus = [raw_text] + [res['body'] for res in web_results]
     vectorizer = TfidfVectorizer()
     tfidf_matrix = vectorizer.fit_transform(corpus)
@@ -108,11 +100,11 @@ def fact_check(payload: TextPayload):
     best_source = web_results[best_match_index]
 
     if max_similarity > 0.12:
-        verdict = "✅ Supported by External Web Sources"
-    elif max_similarity > 0.04:
-        verdict = "⚠️ Context-Dependent / Partial Alignment"
+        verdict = "✅ Supported by Web Evidence"
+    elif max_similarity > 0.05:
+        verdict = "⚠️ Partial Match / Needs Context"
     else:
-        verdict = "🚨 Unsubstantiated Claims"
+        verdict = "🚨 Unsubstantiated (Contradicts or absent from web)"
 
     return {
         "verdict": verdict,
