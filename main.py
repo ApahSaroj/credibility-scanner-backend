@@ -1,107 +1,97 @@
-import re
+import torch
 import math
 from fastapi import FastAPI
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-app = FastAPI(title="Local Statistical NLP Authenticity Engine")
+app = FastAPI(title="SOTA Local NLP Authenticity Engine")
 
-# Security middleware allowing browser connection
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Load a lightweight, open-source model into memory at startup
+# DistilGPT2 is optimized for speed and low RAM footprint (approx. 350MB)
+MODEL_NAME = "distilgpt2"
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
+model.eval()  # Set model to evaluation mode
+
 class TextPayload(BaseModel):
     text: str
 
-def calculate_linguistic_features(text: str):
-    lower_text = text.lower()
-    
-    # Clean words and extract sentences
-    words = [w.strip(",.?!()\"';:") for w in lower_text.split() if w.strip(",.?!()\"';:")]
-    sentences = [s.strip() for s in re.split(r'[.!?]+', text) if len(s.strip().split()) > 2]
-    
-    if len(sentences) < 2 or len(words) < 10:
-        return {"error": "Text too short for reliable statistical profiling. Provide at least 2-3 sentences."}
-
-    # 1. STRUCTURAL BURSTINESS & COEFFICIENT OF VARIATION (CV)
-    sentence_lengths = [len(s.split()) for s in sentences]
-    mean_length = sum(sentence_lengths) / len(sentence_lengths)
-    variance = sum((x - mean_length) ** 2 for x in sentence_lengths) / len(sentence_lengths)
-    std_dev = math.sqrt(variance)
-    # CV measures relative dispersion. Robotic text has highly uniform, low CV.
-    cv = std_dev / mean_length if mean_length > 0 else 0
-
-    # 2. LEXICAL DIVERSITY (Type-Token Ratio - TTR)
-    unique_words = set(words)
-    ttr = len(unique_words) / len(words) if len(words) > 0 else 0
-
-    # 3. SYNTACTIC DENSITY (Punctuation distribution)
-    punctuation_count = len(re.findall(r'[,;:]', text))
-    punc_per_sentence = punctuation_count / len(sentences)
-
-    # 4. ALGORITHMIC TRANSITION MATRIX (Weighted NLP Signatures)
-    ai_structural_markers = {
-        "heavy": ["delve", "testament to", "in conclusion", "ultimately", "furthermore", "moreover", "not only", "demystify"],
-        "hedging": ["it is important to", "clear indication", "crucial role", "vital importance", "essential to note"]
-    }
-    
-    heavy_count = sum(1 for marker in ai_structural_markers["heavy"] if marker in lower_text)
-    hedging_count = sum(1 for marker in ai_structural_markers["hedging"] if marker in lower_text)
-    
-    # 5. RISK SCORING MATRIX
-    # Base baseline configuration derived from human text averages
-    ai_probability_score = 0
-    
-    # CV Penalty (Low structural variance is highly indicative of generative patterns)
-    if cv < 0.35:
-        ai_probability_score += 35
-    elif cv < 0.50:
-        ai_probability_score += 15
-        
-    # TTR Penalty (Low vocabulary diversity flags repetitiveness)
-    if ttr < 0.60:
-        ai_probability_score += 25
-    elif ttr < 0.70:
-        ai_probability_score += 10
-        
-    # Marker Penalties
-    ai_probability_score += (heavy_count * 12)
-    ai_probability_score += (hedging_count * 10)
-    
-    # Normalization bounds
-    final_ai_risk = max(0, min(100, int(ai_probability_score)))
-    human_authenticity = 100 - final_ai_risk
-
-    # Propaganda and Bias Logic
-    propaganda_patterns = ["you must", "obvious choice", "undeniable truth", "everyone knows", "stop wasting time", "secret blueprint"]
-    found_propaganda = [p for p in propaganda_patterns if p in lower_text]
-    
-    # Fact-checking verification indicators (checks for hard quantities/metrics)
-    has_metrics = any(char.isdigit() for char in text)
-
-    if human_authenticity > 70:
-        verdict = "✅ Highly Authentic (Natural Structural Variance)"
-    elif human_authenticity > 45:
-        verdict = "⚠️ Mixed Profile (Possible AI assistance or heavy editing)"
-    else:
-        verdict = "🚨 High AI Congruence (Algorithmic Uniformity Detected)"
-
-    return {
-        "human_score": human_authenticity,
-        "cv_index": round(cv, 2),
-        "lexical_diversity": round(ttr, 2),
-        "data_backed": "Verified Data Points Present" if has_metrics else "Unverified/Anecdotal (No metrics found)",
-        "propaganda_flags": found_propaganda if found_propaganda else ["None detected"],
-        "verdict": verdict
-    }
-
 @app.post("/analyze")
 def analyze_text(payload: TextPayload):
-    result = calculate_linguistic_features(payload.text)
-    if "error" in result:
-        return {"error": result["error"], "human_score": 0, "cv_index": 0, "lexical_diversity": 0, "data_backed": "N/A", "propaganda_flags": [], "verdict": result["error"]}
-    return result
+    text = payload.text
+    
+    # Tokenize input text and convert to tensor format
+    inputs = tokenizer(text, return_tensors="pt")
+    input_ids = inputs["input_ids"]
+    
+    # Ensure text is long enough for mathematical significance
+    if input_ids.shape[1] < 10:
+        return {
+            "verdict": "⚠️ Text too short for neural profiling",
+            "perplexity": 0,
+            "human_score": 0,
+            "confidence": "Low"
+        }
+        
+    with torch.no_grad():
+        # Pass tokens through the local language model to get logits
+        outputs = model(input_ids, labels=input_ids)
+        loss = outputs.loss  # Negative log-likelihood loss
+        logits = outputs.logits
+
+    # 1. CALCULATE PERPLEXITY (PPL)
+    # PPL = exp(loss)
+    perplexity = math.exp(loss.item())
+    
+    # 2. CALCULATE TOKEN RANK DISTRIBUTION (GLTR Logic)
+    # Shift logits and targets to align predictions
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = input_ids[..., 1:].contiguous()
+    
+    top_10_count = 0
+    top_100_count = 0
+    total_tokens = shift_labels.shape[1]
+    
+    # Evaluate where each actual token ranked in the model's prediction matrix
+    for i in range(total_tokens):
+        token_logits = shift_logits[0, i, :]
+        actual_token_id = shift_labels[0, i].item()
+        
+        # Sort probabilities to discover the true token rank
+        sorted_indices = torch.argsort(token_logits, descending=True)
+        rank = (sorted_indices == actual_token_id).nonzero(as_tuple=True)[0].item()
+        
+        if rank <= 10:
+            top_10_count += 1
+        if rank <= 100:
+            top_100_count += 1
+
+    top_10_ratio = top_10_count / total_tokens
+    top_100_ratio = top_100_count / total_tokens
+
+    # 3. VERDICT DECISION MATRIX
+    # SOTA thresholds: AI text generates low perplexity and high top-10 predictability
+    if perplexity < 25.0 and top_10_ratio > 0.65:
+        verdict = "🚨 High AI Congruence (Highly Predictable Token Paths)"
+        human_score = int((perplexity / 25.0) * 30)  # Map down to lower score
+    elif perplexity > 55.0 or top_10_ratio < 0.40:
+        verdict = "✅ Authentically Human (High Token Chaos)"
+        human_score = min(100, int(40 + (perplexity / 3.0)))
+    else:
+        verdict = "⚠️ Mixed / Highly Edited Profile"
+        human_score = int(35 + (perplexity / 2.0))
+
+    return {
+        "verdict": verdict,
+        "perplexity": round(perplexity, 2),
+        "top_10_predictability": f"{round(top_10_ratio * 100, 1)}%",
+        "human_score": max(0, min(100, human_score))
+    }
