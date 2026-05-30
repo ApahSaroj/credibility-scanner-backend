@@ -4,13 +4,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from duckduckgo_search import DDGS
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-import spacy
-import en_core_web_sm
+import yake
+import re
 
-# Load the NLP model directly into memory
-nlp = en_core_web_sm.load()
-
-app = FastAPI(title="Enterprise NLP Fact Checker")
+app = FastAPI(title="Enterprise Fact Checker (Lightweight NLP)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -24,33 +21,41 @@ class TextPayload(BaseModel):
 
 def extract_surgical_query(text: str) -> str:
     """
-    Uses Named Entity Recognition (NER) to understand the grammatical structure 
-    and isolate only verifiable entities (Orgs, Locations, Money, Percentages).
+    Uses YAKE (Statistical NLP) to isolate the core factual entities 
+    and metrics without requiring heavy machine learning models.
     """
-    doc = nlp(text)
+    # 1. Strip the social media fluff first
+    fluff_phrases = ["super excited", "thrilled to share", "proud to announce", "i believe that", "glad to announce", "after months of work"]
+    clean_text = text.lower()
+    for fluff in fluff_phrases:
+        clean_text = clean_text.replace(fluff, "")
+
+    # 2. Mathematically extract the top 4 most important concepts
+    kw_extractor = yake.KeywordExtractor(lan="en", n=2, dedupLim=0.9, top=4)
+    keywords = kw_extractor.extract_keywords(clean_text)
     
-    # Target specific grammatical entities
-    target_labels = {"ORG", "GPE", "PERCENT", "MONEY", "DATE", "CARDINAL", "QUANTITY", "EVENT"}
-    entities = [ent.text for ent in doc.ents if ent.label_ in target_labels]
-    
-    # If the text is sparse, fallback to core noun chunks (e.g., "groundwater depletion")
-    if not entities:
-        entities = [chunk.text for chunk in doc.noun_chunks]
+    if not keywords:
+        words = re.findall(r'\b\w+\b', clean_text)
+        return " ".join(words[:8])
         
-    if not entities:
-        return text[:50] # Failsafe
-        
-    query = " ".join(entities)
+    # 3. Build the core query
+    query_parts = [kw[0] for kw in keywords]
+    query = " ".join(query_parts)
     
-    # Clean duplicates and limit to 10 words for search API safety
-    words = list(dict.fromkeys(query.split()))
-    return " ".join(words[:10])
+    # 4. Guarantee that hard numbers are included in the search
+    numbers = re.findall(r'\b\d+(?:\.\d+)?%?\b', text)
+    if numbers:
+        query += " " + " ".join(numbers[:2])
+        
+    # Clean duplicates and limit to 10 words for search engine safety
+    final_words = list(dict.fromkeys(query.split()))
+    return " ".join(final_words[:10])
 
 @app.post("/factcheck")
 def fact_check(payload: TextPayload):
     raw_text = payload.text
     if len(raw_text.split()) < 4:
-         return {"error": "Text segment too brief for NLP processing."}
+         return {"error": "Text segment too brief for processing."}
 
     search_query = extract_surgical_query(raw_text)
 
