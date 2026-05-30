@@ -1,5 +1,5 @@
 fastapi
 uvicorn
 pydantic
-transformers
-torch
+duckduckgo-search
+scikit-learn
